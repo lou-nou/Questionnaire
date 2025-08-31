@@ -17,6 +17,13 @@ if df.empty:
     st.warning("Aucune donnée enregistrée pour le moment.")
     st.stop()
 
+# Bouton d'export
+st.download_button(
+    label="📁 Télécharger les données en CSV",
+    data=df.to_csv(index=False).encode('utf-8'),
+    file_name="evaluations_export.csv",
+    mime="text/csv"
+)
 # # Affichage brut
 # st.subheader("📋 Données enregistrées")
 # st.dataframe(df, use_container_width=True)
