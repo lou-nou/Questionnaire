@@ -7,3 +7,6 @@ credentials.json
 __pycache__/
 *.pyc
 logs/
+secrets.toml
+remove-paths.txt
+runtime.tx

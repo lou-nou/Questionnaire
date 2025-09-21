@@ -253,3 +253,10 @@ if "id_participant" not in st.session_state:
 # =========================
 def enregistrer_reponse(notes, critere):
     st.session_sta_
+
+
+try:
+    sa_email = json.loads(st.secrets["gcp"]["credentials"])["client_email"]
+    st.caption(f"Service account détecté : {sa_email}")
+except Exception as e:
+    st.warning(f"Secret GCP introuvable : {e}")
