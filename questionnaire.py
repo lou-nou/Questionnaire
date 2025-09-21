@@ -4,180 +4,50 @@ import sqlite3
 from datetime import datetime
 import os
 import gspread
-from google.oauth2.service_account import Credentials as SACredentials
+#from google.oauth2.service_account import Credentials
 import numpy as np
 import uuid
+
+# --- Fonction de sauvegarde Google Sheets ---
+# --- Google Sheets (via Streamlit Secrets) ---
 import json
-import re
-import time
-from contextlib import closing
+from google.oauth2.service_account import Credentials as SACredentials
 
-# =========================
-# CONFIG / CONSTANTES
-# =========================
-st.set_page_config(page_title="Évaluation de critères", page_icon="📊", layout="wide")
+# (optionnel) ID par défaut si rien n'est défini dans les secrets
+DEFAULT_SHEET_ID = "1HbregwmVT8-adMkFxWGBu_JNSfrmBHM3FJWCR3hI_dI"
 
-GSPREAD_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-DEFAULT_DB_PATH = "evaluation.db"
-DEFAULT_TABLE = "evaluations"
-GOOGLE_SHEET_ID = "1HbregwmVT8-adMkFxWGBu_JNSfrmBHM3FJWCR3hI_dI"  # <-- remplace si besoin
+# Lit l'ID depuis les secrets, sinon fallback sur DEFAULT_SHEET_ID
+GOOGLE_SHEET_ID = st.secrets.get("gcp", {}).get("sheet_id", DEFAULT_SHEET_ID)
 
-# =========================
-# CREDENTIALS GCP (sécurisé)
-# =========================
-def load_gcp_credentials(
-    scopes=GSPREAD_SCOPES,
-    secrets_path=("gcp", "credentials"),
-    env_var="GOOGLE_APPLICATION_CREDENTIALS",
-    fallback_local_path="credentials.json",
-) -> SACredentials:
-    """
-    Charge les credentials GCP dans cet ordre:
-      1) st.secrets['gcp']['credentials'] : JSON string multi-ligne (recommandé, Cloud & local .streamlit/secrets.toml)
-      2) variable d'env GOOGLE_APPLICATION_CREDENTIALS : chemin vers un fichier JSON
-      3) fichier local 'credentials.json' (pour dev local, ignoré par git)
-
-    Retourne un objet google.oauth2.service_account.Credentials
-    """
-    # 1) Streamlit secrets
+def _get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     try:
-        sect, key = secrets_path
-        raw = st.secrets[sect][key]
-        info = json.loads(raw)
-        return SACredentials.from_service_account_info(info, scopes=scopes)
-    except Exception:
-        pass
-
-    # 2) Variable d'environnement (chemin vers le fichier JSON)
-    cred_path = os.getenv(env_var)
-    if cred_path and os.path.exists(cred_path):
-        return SACredentials.from_service_account_file(cred_path, scopes=scopes)
-
-    # 3) Fallback local (non versionné)
-    if os.path.exists(fallback_local_path):
-        st.warning("⚠️ Utilisation d’un credentials.json local (non recommandé en production).")
-        return SACredentials.from_service_account_file(fallback_local_path, scopes=scopes)
-
-    st.error(
-        "Aucun identifiant GCP trouvé. Ajoute ta clé dans **Settings → Secrets** "
-        "sous `gcp.credentials` (JSON), ou définis `GOOGLE_APPLICATION_CREDENTIALS`, "
-        "ou place un fichier local `credentials.json` (ignoré par git)."
-    )
-    st.stop()
-
-def get_gspread_client():
-    creds = load_gcp_credentials()
+        info = json.loads(st.secrets["gcp"]["credentials"])  # JSON (string) -> dict
+    except Exception as e:
+        st.error("Secret `gcp.credentials` introuvable ou invalide dans Settings → Secrets.")
+        raise
+    creds = SACredentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-# =========================
-# SQLite robuste
-# =========================
-def _snake(s: str) -> str:
-    s = re.sub(r"\s+", "_", s.strip())
-    s = re.sub(r"[^\w]", "_", s, flags=re.UNICODE)
-    s = re.sub(r"_+", "_", s)
-    return s.strip("_").lower()
-
-def _sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # noms sûrs & uniques
-    new_cols, seen = [], set()
-    for c in df.columns.map(str):
-        base, name, i = _snake(c), None, 1
-        name = base
-        while name in seen:
-            i += 1
-            name = f"{base}_{i}"
-        seen.add(name)
-        new_cols.append(name)
-    df.columns = new_cols
-
-    # types
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        elif pd.api.types.is_bool_dtype(df[c]):
-            df[c] = df[c].astype("int64")
-        elif pd.api.types.is_object_dtype(df[c]):
-            df[c] = df[c].apply(lambda x: None if (pd.isna(x) or x == "") else str(x))
-        elif pd.api.types.is_numeric_dtype(df[c]):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        else:
-            df[c] = df[c].astype("string")
-
-    df = df.where(pd.notna(df), None)  # NaN -> NULL
-    return df
-
-def _safe_chunksize(n_cols: int) -> int:
-    # Respect limite SQLite ~999 variables → marge
-    return max(1, 900 // max(1, n_cols))
-
-def sauvegarder_reponses_sqlite(df: pd.DataFrame, db_path: str = DEFAULT_DB_PATH, table: str = DEFAULT_TABLE) -> None:
-    if df is None or df.empty:
-        raise ValueError("Aucune donnée à enregistrer.")
-
-    df2 = _sanitize_dataframe(df)
-    chunksize = _safe_chunksize(len(df2.columns))
-    max_retries, delay = 5, 0.5
-
-    with closing(sqlite3.connect(db_path, timeout=30, check_same_thread=False)) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                df2.to_sql(
-                    table,
-                    conn,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    chunksize=chunksize,
-                )
-                conn.commit()
-                break
-            except sqlite3.OperationalError as e:
-                msg = str(e)
-                if "has no column named" in msg or "no such column" in msg:
-                    raise RuntimeError(
-                        f"Schéma incompatible avec la table '{table}'. "
-                        f"Supprime/renomme la base ou migre le schéma. Détails: {msg}"
-                    ) from e
-                if "no such table" in msg:
-                    df2.head(0).to_sql(table, conn, if_exists="fail", index=False)
-                    continue
-                if "database is locked" in msg:
-                    if attempt < max_retries:
-                        time.sleep(delay * attempt)
-                        continue
-                    raise RuntimeError("Base verrouillée. Réessaie plus tard.") from e
-                if "too many SQL variables" in msg:
-                    new_chunksize = max(1, chunksize // 2)
-                    if new_chunksize == chunksize:
-                        raise
-                    chunksize = new_chunksize
-                    continue
-                raise RuntimeError(f"Erreur SQLite: {msg}") from e
-            except sqlite3.IntegrityError as e:
-                raise RuntimeError(f"Contrainte UNIQUE/NOT NULL violée : {e}") from e
-
-# =========================
-# Google Sheets
-# =========================
-def sauvegarder_reponses_google_sheets(df: pd.DataFrame, sheet_id: str, header_mode: str = "insert_if_missing"):
+def sauvegarder_reponses_google_sheets(df: pd.DataFrame, sheet_id: str | None = None,
+                                       header_mode: str = "insert_if_missing"):
     """
-    Envoie les données + en-têtes dans Google Sheets.
+    Envoie les données dans Google Sheets, avec gestion des en-têtes.
     header_mode ∈ {"insert_if_missing", "overwrite", "keep"}
     """
-    client = get_gspread_client()
+    if sheet_id is None:
+        sheet_id = GOOGLE_SHEET_ID
+    if not sheet_id:
+        st.error("Aucun 'sheet_id' fourni et aucun 'gcp.sheet_id' dans les secrets.")
+        return
+
+    client = _get_gspread_client()
     sheet = client.open_by_key(sheet_id).sheet1
 
-    # Nettoyage valeurs (et datetimes → string)
+    # Nettoyage valeurs (inf/NaN) et datetimes -> string
     df = df.copy()
     for c in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[c]):
@@ -186,6 +56,7 @@ def sauvegarder_reponses_google_sheets(df: pd.DataFrame, sheet_id: str, header_m
 
     headers = [str(c) for c in df.columns.tolist()]
 
+    # Gestion des en-têtes
     if header_mode != "keep":
         try:
             first_row = sheet.row_values(1)
@@ -200,13 +71,16 @@ def sauvegarder_reponses_google_sheets(df: pd.DataFrame, sheet_id: str, header_m
                 elif header_mode == "overwrite":
                     sheet.update("1:1", [headers])
 
+    # Ajout des données
     rows = df.astype(object).values.tolist()
     if rows:
         sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
-# =========================
-# DONNÉES QUESTIONNAIRE
-# =========================
+
+# --- Config page ---
+st.set_page_config(page_title="Évaluation de critères", page_icon="📊", layout="wide")
+
+# --- Données ---
 criteres = [
     "Impact énergie-climat",
     "Coût d’investissement (CAPEX)",
@@ -217,7 +91,7 @@ criteres = [
     "Effet levier ou structurant",
     "Durée de vie de l’action",
     "Acceptabilité pour les utilisateurs",
-    "Visibilité et exemplarité",
+    "Visibilité et exemplarité"
 ]
 
 axes = [
@@ -225,7 +99,7 @@ axes = [
     "capacité discriminante",
     "fiabilité de l'évaluation",
     "Acceptabilité politique et sociale",
-    "temporalité/Durabilité",
+    "temporalité/Durabilité"
 ]
 
 axes_definitions = {
@@ -233,12 +107,10 @@ axes_definitions = {
     "capacité discriminante": "Capacité du critère à distinguer clairement les différentes options",
     "fiabilité de l'évaluation": "Niveau de fiabilité et facilité d'obtention des données",
     "Acceptabilité politique et sociale": "Niveau d'acceptabilité et de soutien par les parties prenantes",
-    "temporalité/Durabilité": "Stabilité de l'importance du critère dans le temps",
+    "temporalité/Durabilité": "Stabilité de l'importance du critère dans le temps"
 }
 
-# =========================
-# SESSION STATE
-# =========================
+# --- Init session ---
 if "page" not in st.session_state:
     st.session_state.page = 0
 if "reponses" not in st.session_state:
@@ -248,15 +120,131 @@ if "fin" not in st.session_state:
 if "id_participant" not in st.session_state:
     st.session_state.id_participant = str(uuid.uuid4())[:8]  # ID court et unique
 
-# =========================
-# FONCTIONS MÉTIER
-# =========================
+# --- Fonctions ---
 def enregistrer_reponse(notes, critere):
-    st.session_sta_
+    st.session_state.reponses[critere] = notes
 
+def sauvegarder_reponses_sqlite(df):
+    conn = sqlite3.connect("evaluation.db")
+    df.to_sql("evaluations", conn, if_exists="append", index=False)
+    conn.close()
 
-try:
-    sa_email = json.loads(st.secrets["gcp"]["credentials"])["client_email"]
-    st.caption(f"Service account détecté : {sa_email}")
-except Exception as e:
-    st.warning(f"Secret GCP introuvable : {e}")
+def transformer_reponses(reponses, autres_criteres, commentaires, id_participant, date_validation):
+    # Pivotage : une ligne par axe, colonnes = critères + autres champs
+    lignes = []
+    for i, axe in enumerate(axes):
+        ligne = {
+            "id_participant": id_participant,
+            "date_validation": date_validation,
+            "critere_evaluation": axe
+        }
+        for critere in criteres:
+            note = reponses.get(critere, {}).get(axe, "")
+            ligne[critere] = note
+        # Ajouter les champs ouverts seulement sur la première ligne
+        if i == 0:
+            ligne["Autres critères suggérés"] = autres_criteres
+            ligne["Commentaires / Remarques"] = commentaires
+        else:
+            ligne["Autres critères suggérés"] = ""
+            ligne["Commentaires / Remarques"] = ""
+        lignes.append(ligne)
+    return pd.DataFrame(lignes)
+
+# --- Bloc questionnaire / questions ouvertes ---
+if not st.session_state.fin:
+    if st.session_state.page < len(criteres):
+        # 🔹 Affichage d’un critère
+        critere = criteres[st.session_state.page]
+        st.title("📊 Évaluation de critères d'aide à la décision")
+        st.subheader(f"Critère {st.session_state.page + 1} sur {len(criteres)} : {critere}")
+
+        progress = (st.session_state.page + 1) / (len(criteres) + 1)
+        st.progress(progress)
+        st.caption(f"Progression : {st.session_state.page + 1}/{len(criteres)+1} étapes")
+
+        notes = {}
+        for axe in axes:
+            st.markdown(f"**{axe.capitalize()}** — *{axes_definitions[axe]}*")
+            note = st.slider(
+                f"Note pour {axe}", 1, 10, 5,
+                key=f"slider-{st.session_state.page}-{axe}"
+            )
+            notes[axe] = note
+
+        st.markdown("---")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.session_state.page > 0:
+                st.button("⬅️ Précédent", on_click=lambda: setattr(st.session_state, 'page', st.session_state.page - 1))
+        with col2:
+            if st.session_state.page < len(criteres) - 1:
+                st.button("Suivant ➡️", on_click=lambda: (
+                    enregistrer_reponse(notes, critere),
+                    setattr(st.session_state, 'page', st.session_state.page + 1)
+                ))
+            else:
+                st.button("📄 Questions ouvertes ➡️", on_click=lambda: (
+                    enregistrer_reponse(notes, critere),
+                    setattr(st.session_state, 'page', st.session_state.page + 1)
+                ))
+
+    else:
+        # 🔹 Questions ouvertes
+        st.title("📝 Questions ouvertes")
+        autre_critere = st.text_area(
+            "Quel(s) autre(s) critère(s) d'aide à la décision vous semble-t-il important à ajouter à ce questionnaire ?"
+        )
+        commentaires = st.text_area(
+            "Merci de nous indiquer vos commentaires et remarques sur ce questionnaire :"
+        )
+
+        st.markdown("---")
+        st.subheader("📋 Récapitulatif de vos évaluations")
+        reponses = st.session_state.get("reponses", {})
+        if reponses:
+            df = pd.DataFrame(reponses).T
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.write("Aucune réponse enregistrée pour l'instant.")
+
+        def valider_questionnaire():
+            date_validation = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            id_participant = st.session_state.id_participant
+            # Transformation au format cible
+            df_final = transformer_reponses(
+                st.session_state.reponses,
+                autre_critere,
+                commentaires,
+                id_participant,
+                date_validation
+            )
+            # Sauvegarde SQLite
+            sauvegarder_reponses_sqlite(df_final)
+            # Sauvegarde Google Sheets avec en-têtes
+            sheet_id = "1HbregwmVT8-adMkFxWGBu_JNSfrmBHM3FJWCR3hI_dI"  # Remplace par l’ID de ta feuille Google Sheets
+            sauvegarder_reponses_google_sheets(df_final, sheet_id, header_mode="insert_if_missing")
+            # Marquer questionnaire comme terminé
+            st.session_state.fin = True
+
+        st.button("✅ Valider le questionnaire", on_click=valider_questionnaire)
+
+# --- Bloc redirection / message de fin ---
+if st.session_state.fin:
+    st.title("🎉 Merci de votre participation !")
+    st.write("""
+    Nous reviendrons vers vous rapidement avec le deuxième tour de l'évaluation, 
+    accompagné de la synthèse des résultats du premier tour.
+    """)
+
+# --- Bouton d'export de la base SQLite ---
+if os.path.exists("evaluation.db"):
+    with open("evaluation.db", "rb") as f:
+        st.download_button(
+            label="📥 Télécharger la base de données (evaluation.db)",
+            data=f,
+            file_name="evaluation.db",
+            mime="application/octet-stream"
+        )
+else:
+    st.info("Aucune base de données à télécharger pour le moment.")

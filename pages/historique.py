@@ -1,86 +1,128 @@
+# pages/historique.py
 import streamlit as st
 import pandas as pd
 import sqlite3
-import matplotlib.pyplot as plt
-import numpy as np
+from pathlib import Path
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Historique des réponses", page_icon="📂", layout="wide")
+st.set_page_config(page_title="Historique des réponses", page_icon="📈", layout="wide")
 
-st.title("📂 Historique et statistiques des évaluations")
+DB_PATH = "evaluation.db"
+TABLE = "evaluations"
 
-# Charger la base
-conn = sqlite3.connect("evaluation.db")
-df = pd.read_sql("SELECT * FROM evaluations", conn)
-conn.close()
-
-if df.empty:
-    st.warning("Aucune donnée enregistrée pour le moment.")
+# 0) Sécurité: base présente ?
+if not Path(DB_PATH).exists():
+    st.error(f"Base introuvable : {DB_PATH}")
     st.stop()
 
-# Bouton d'export
-st.download_button(
-    label="📁 Télécharger les données en CSV",
-    data=df.to_csv(index=False).encode('utf-8'),
-    file_name="evaluations_export.csv",
-    mime="text/csv"
+# 1) Lecture DB
+with sqlite3.connect(DB_PATH) as conn:
+    df = pd.read_sql(f"SELECT * FROM {TABLE}", conn)
+
+if df.empty:
+    st.info("Aucune donnée pour le moment.")
+    st.stop()
+
+# 2) Harmoniser quelques noms
+df = df.rename(columns={
+    "date_validation": "Date",
+    "critere_evaluation": "Axe",
+})
+
+# 3) Colonnes méta exactes d’après ton schéma
+meta_cols = {
+    "id_participant",
+    "Date",
+    "Axe",
+    "Autres critères suggérés",
+    "Commentaires / Remarques",
+}
+
+# 4) Colonnes critères (tout ce qui n’est pas méta)
+critere_cols = [c for c in df.columns if c not in meta_cols]
+
+# 5) Long format → colonnes: Date, Axe, id_participant, Critère, Note
+long = df.melt(
+    id_vars=[c for c in ["Date", "Axe", "id_participant"] if c in df.columns],
+    value_vars=critere_cols,
+    var_name="Critère",
+    value_name="Note",
 )
-# # Affichage brut
-# st.subheader("📋 Données enregistrées")
-# st.dataframe(df, use_container_width=True)
 
-# Stats descriptives
-st.subheader("📊 Statistiques descriptives")
-stats = df.drop(columns=["Date"], errors="ignore").groupby("Critère").agg(
-    Moyenne=pd.NamedAgg(column="Pertinence stratégique", aggfunc="mean")
+# 6) Nettoyage / types
+long["Note"] = pd.to_numeric(long["Note"], errors="coerce")
+long = long.dropna(subset=["Note"])
+if "Date" in long.columns:
+    long["Date"] = pd.to_datetime(long["Date"], errors="coerce")
+
+# 7) Stats par Critère et par Axe (avec Médiane)
+stats_crit = (
+    long.groupby("Critère", as_index=False)["Note"]
+        .agg(N="count", Moyenne="mean", Médiane="median", ÉcartType="std", Min="min", Max="max")
+        .sort_values("Moyenne", ascending=False)
 )
 
-# Pour chaque axe, calculer stats
-axes = [c for c in df.columns if c not in ["Critère", "Date", "Réponse"]]
-summary = {}
-for axe in axes:
-    grouped = df.groupby("Critère")[axe].agg([
-        "mean", "std", "median", 
-        lambda x: np.percentile(x, 25), 
-        lambda x: np.percentile(x, 75)
-    ])
-    grouped.columns = ["Moyenne", "Écart-type", "Médiane", "P25", "P75"]
-    summary[axe] = grouped
+stats_axes = (
+    long.groupby("Axe", as_index=False)["Note"]
+        .agg(N="count", Moyenne="mean", Médiane="median", ÉcartType="std", Min="min", Max="max")
+        .sort_values("Moyenne", ascending=False)
+)
 
-# Affichage des stats
-for axe, table in summary.items():
-    st.markdown(f"### 🔎 {axe}")
-    st.dataframe(table.round(2), use_container_width=True)
+# 8) UI
+st.title("📈 Historique des réponses")
+col_top1, col_top2 = st.columns(2)
+with col_top1:
+    st.subheader("Métrique à visualiser")
+    metric = st.selectbox("Choisir la métrique pour les radars", ["Moyenne", "Médiane"], index=0)
+with col_top2:
+    lock_range = st.checkbox("Fixer l’échelle 1–10", value=True)
 
-# Radar
+# 9) Radar Critères
+st.subheader(f"Radar par **critère** ({metric})")
+if not stats_crit.empty:
+    r_vals = stats_crit[metric].tolist()
+    theta_vals = stats_crit["Critère"].tolist()
+    fig_crit = go.Figure()
+    fig_crit.add_trace(go.Scatterpolar(
+        r=r_vals, theta=theta_vals,
+        fill='toself', name=metric, hovertemplate="%{theta}<br>"+metric+"=%{r:.2f}<extra></extra>"
+    ))
+    fig_crit.update_layout(
+        margin=dict(l=10, r=10, t=40, b=10),
+        polar=dict(radialaxis=dict(visible=True, range=[1,10] if lock_range else None)),
+        showlegend=False,
+        title=f"Métrique : {metric}"
+    )
+    st.plotly_chart(fig_crit, use_container_width=True)
+else:
+    st.info("Pas de données critère.")
 
-import numpy as np
-import matplotlib.pyplot as plt
+# 10) Radar Axes
+st.subheader(f"Radar par **axe** ({metric})")
+if "Axe" in long.columns and not stats_axes.empty:
+    r_vals = stats_axes[metric].tolist()
+    theta_vals = stats_axes["Axe"].tolist()
+    fig_axes = go.Figure()
+    fig_axes.add_trace(go.Scatterpolar(
+        r=r_vals, theta=theta_vals,
+        fill='toself', name=metric, hovertemplate="%{theta}<br>"+metric+"=%{r:.2f}<extra></extra>"
+    ))
+    fig_axes.update_layout(
+        margin=dict(l=10, r=10, t=40, b=10),
+        polar=dict(radialaxis=dict(visible=True, range=[1,10] if lock_range else None)),
+        showlegend=False,
+        title=f"Métrique : {metric}"
+    )
+    st.plotly_chart(fig_axes, use_container_width=True)
+else:
+    st.info("Pas de données axe.")
 
-st.subheader("📈 Visualisation radar")
-criteres = df["Critère"].unique()
-axes_eval = [a for a in df.columns if a not in ["Critère", "Date", "Réponse"]]
-
-if axes_eval:
-    mean_values = df.groupby("Critère")[axes_eval].mean()
-
-    for critere in mean_values.index:
-        values = mean_values.loc[critere].values.flatten().tolist()
-        values += values[:1]  # fermeture du polygone
-
-        # angles pour chaque axe original
-        angles = np.linspace(0, 2*np.pi, len(axes_eval), endpoint=False)
-        angles = np.concatenate((angles, [angles[0]]))  # fermeture
-
-        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-        ax.plot(angles, values, linewidth=2, label=critere)
-        ax.fill(angles, values, alpha=0.25)
-
-        # ticks : seulement sur les axes originaux, pas le point répété
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(axes_eval)
-
-        ax.set_title(f"Radar des notes pour {critere}")
-        ax.legend(loc="upper right", bbox_to_anchor=(1.1, 1.1))
-        st.pyplot(fig)
-
-st.info("💡 Les graphiques et statistiques vous permettent de comparer les critères et d'identifier les points forts et faibles.")
+# 11) Tables détaillées
+st.subheader("📋 Statistiques détaillées")
+tabs = st.tabs(["Par critère", "Par axe", "Brut (5 dernières lignes)"])
+with tabs[0]:
+    st.dataframe(stats_crit, use_container_width=True)
+with tabs[1]:
+    st.dataframe(stats_axes, use_container_width=True)
+with tabs[2]:
+    st.dataframe(df.tail(5), use_container_width=True)
